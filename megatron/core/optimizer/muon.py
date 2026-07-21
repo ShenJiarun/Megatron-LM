@@ -41,6 +41,32 @@ if HAVE_EMERGING_OPTIMIZERS:
 logger = logging.getLogger(__name__)
 
 
+def _get_momentum_value(group: Dict[str, Any], defaults: Dict[str, Any]) -> float:
+    """Support both new ``momentum`` and legacy ``momentum_beta`` param-group keys."""
+    if "momentum" in group:
+        return float(group["momentum"])
+    if "momentum_beta" in group:
+        return float(group["momentum_beta"])
+    if "momentum" in defaults:
+        return float(defaults["momentum"])
+    if "momentum_beta" in defaults:
+        return float(defaults["momentum_beta"])
+    raise KeyError("Missing Muon optimizer hyperparameter 'momentum' in param_group and defaults")
+
+
+def _normalize_momentum_keys(param_groups: List[Dict[str, Any]], defaults: Dict[str, Any]) -> None:
+    """Backfill the canonical ``momentum`` key for old checkpoints / callers."""
+    momentum = defaults.get("momentum", defaults.get("momentum_beta"))
+    if momentum is not None and "momentum" not in defaults:
+        defaults["momentum"] = momentum
+    for group in param_groups:
+        if "momentum" not in group:
+            if "momentum_beta" in group:
+                group["momentum"] = group["momentum_beta"]
+            elif momentum is not None:
+                group["momentum"] = momentum
+
+
 def get_supported_coefficient_types() -> tuple[str, ...]:
     """Return the coefficient types supported by the installed emerging_optimizers.
 
@@ -70,8 +96,8 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self,
         params: ParamsT,
         lr: float = 3e-4,
-        momentum_beta: float = 0.95,
-        use_nesterov: bool = True,
+        momentum: float = 0.95,
+        nesterov: bool = True,
         weight_decay: float = 0.01,
         use_decoupled_weight_decay: bool = True,
         split_qkv: bool = False,
@@ -84,8 +110,14 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         extra_scale_factor: float = 1.0,
         pg_collection: Optional[ProcessGroupCollection] = None,
         mode: Literal["blockwise", "duplicated", "distributed"] = "duplicated",
+        momentum_beta: float | None = None,
+        use_nesterov: bool | None = None,
         kwargs: Dict[str, Any] = {},
     ) -> None:
+        if momentum_beta is not None:
+            momentum = momentum_beta
+        if use_nesterov is not None:
+            nesterov = use_nesterov
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
         validate_coefficient_type(coefficient_type)
@@ -123,17 +155,17 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self.qkv_split_shapes = qkv_split_shapes
 
         weight_decay_method = "decoupled" if use_decoupled_weight_decay else "l2"
-        nesterov_kwarg = {"nesterov": use_nesterov}
         super().__init__(
             params,
             lr,
-            momentum_beta,
-            **nesterov_kwarg,
+            momentum,
+            nesterov=nesterov,
             weight_decay=weight_decay,
             weight_decay_method=weight_decay_method,
             fp32_matmul_prec=fp32_matmul_prec,
             scaled_orthogonalize_fn=scaled_orthogonalize_fn,
         )
+        _normalize_momentum_keys(self.param_groups, self.defaults)
 
     def orthogonalize(self, p: torch.Tensor, grad: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Orthogonalize the momentum.
@@ -206,7 +238,7 @@ class AdaptiveTensorParallelMuon(OrthogonalizedOptimizer):
 
     Actions:
       z_t >= tau_high -> full orth, lr_full
-      z_low <= z_t < tau_high -> build leaky pressure and decay local lr_block
+      z_low <= z_t < tau_high -> build leaky pressure
       pressure_t >= H -> full orth, lr_full
       otherwise -> local blockwise orth, lr_block
 
@@ -222,8 +254,8 @@ class AdaptiveTensorParallelMuon(OrthogonalizedOptimizer):
         self,
         params: ParamsT,
         lr: float = 3e-4,
-        momentum_beta: float = 0.95,
-        use_nesterov: bool = True,
+        momentum: float = 0.95,
+        nesterov: bool = True,
         weight_decay: float = 0.01,
         use_decoupled_weight_decay: bool = True,
         split_qkv: bool = False,
@@ -248,8 +280,6 @@ class AdaptiveTensorParallelMuon(OrthogonalizedOptimizer):
         snecv_pressure_alpha: float = 1.0,
         snecv_pressure_threshold_h: float = 4.0,
         snecv_pressure_reset_factor: float = 0.0,
-        snecv_local_lr_gamma: float = 0.5,
-        snecv_use_smooth_local_lr_decay: bool = False,
         snecv_monitor_signal: Literal[
             "energy_cv",
             "stable_rank_cv",
@@ -264,7 +294,13 @@ class AdaptiveTensorParallelMuon(OrthogonalizedOptimizer):
         comm_budget_rho: float | None = None,
         snecv_stats_log_interval: int = 0,
         muonbp_full_update_interval: int | None = None,
+        momentum_beta: float | None = None,
+        use_nesterov: bool | None = None,
     ) -> None:
+        if momentum_beta is not None:
+            momentum = momentum_beta
+        if use_nesterov is not None:
+            nesterov = use_nesterov
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
         if not (0.0 <= snecv_beta < 1.0):
@@ -273,9 +309,9 @@ class AdaptiveTensorParallelMuon(OrthogonalizedOptimizer):
             raise ValueError(f"snecv_warmup_steps must be >= 0, got {snecv_warmup_steps}")
         if snecv_z_low < 0.0:
             raise ValueError(f"snecv_z_low must be >= 0, got {snecv_z_low}")
-        if snecv_z_high <= snecv_z_low:
+        if snecv_z_high < snecv_z_low:
             raise ValueError(
-                f"snecv_z_high must be > snecv_z_low, got {snecv_z_high} <= {snecv_z_low}"
+                f"snecv_z_high must be >= snecv_z_low, got {snecv_z_high} < {snecv_z_low}"
             )
         if not (0.0 <= snecv_pressure_gamma <= 1.0):
             raise ValueError(
@@ -293,10 +329,6 @@ class AdaptiveTensorParallelMuon(OrthogonalizedOptimizer):
             raise ValueError(
                 "snecv_pressure_reset_factor must be in [0, 1], "
                 f"got {snecv_pressure_reset_factor}"
-            )
-        if snecv_local_lr_gamma < 0.0:
-            raise ValueError(
-                f"snecv_local_lr_gamma must be >= 0, got {snecv_local_lr_gamma}"
             )
         valid_monitor_signals = {
             "energy_cv",
@@ -356,8 +388,6 @@ class AdaptiveTensorParallelMuon(OrthogonalizedOptimizer):
         self.snecv_pressure_alpha = snecv_pressure_alpha
         self.snecv_pressure_threshold_h = snecv_pressure_threshold_h
         self.snecv_pressure_reset_factor = snecv_pressure_reset_factor
-        self.snecv_local_lr_gamma = snecv_local_lr_gamma
-        self.snecv_use_smooth_local_lr_decay = snecv_use_smooth_local_lr_decay
         self.snecv_monitor_signal = snecv_monitor_signal
         self.snecv_monitor_sketch_q = snecv_monitor_sketch_q
         self.snecv_monitor_power_iters = snecv_monitor_power_iters
@@ -388,13 +418,14 @@ class AdaptiveTensorParallelMuon(OrthogonalizedOptimizer):
         super().__init__(
             params,
             lr,
-            momentum_beta,
-            nesterov=use_nesterov,
+            momentum=momentum,
+            nesterov=nesterov,
             weight_decay=weight_decay,
             weight_decay_method=weight_decay_method,
             fp32_matmul_prec=fp32_matmul_prec,
             scaled_orthogonalize_fn=None,  # handled in orthogonalize()
         )
+        _normalize_momentum_keys(self.param_groups, self.defaults)
 
     def _param_id(self, p: torch.Tensor) -> int:
         return id(p)
@@ -693,22 +724,7 @@ class AdaptiveTensorParallelMuon(OrthogonalizedOptimizer):
         self._budget_threshold += eta_t * (indicator - self.comm_budget_rho)
 
         # keep the threshold in a sane range
-        self._budget_threshold = max(
-            self.snecv_z_low + 1e-6,
-            min(self._budget_threshold, 10.0),
-        )
-
-    def _get_local_lr_scale(self, z: float, threshold: float) -> float:
-        """Return the blockwise LR multiplier for the current z-score regime."""
-        if z < self.snecv_z_low or z >= threshold:
-            return 1.0
-
-        if self.snecv_use_smooth_local_lr_decay:
-            penalty = max(0.0, z - self.snecv_z_low)
-        else:
-            penalty = max(0.0, z)
-
-        return 1.0 / (1.0 + self.snecv_local_lr_gamma * penalty)
+        self._budget_threshold = max(1e-6, min(self._budget_threshold, 10.0))
 
     def _scaled_orthogonalize(
         self,
@@ -736,7 +752,7 @@ class AdaptiveTensorParallelMuon(OrthogonalizedOptimizer):
             coefficient_type=self.coefficient_type,
             tp_group=tp_group,
             partition_dim=partition_dim,
-            mode=ns_mode,
+            tp_mode=ns_mode,
         )
 
         scale_factor = get_muon_scale_factor(size[0], size[1], mode=self.scale_mode)
@@ -764,7 +780,6 @@ class AdaptiveTensorParallelMuon(OrthogonalizedOptimizer):
 
         step = int(self._muon_global_step)
         use_full = False
-        local_lr_scale = 1.0
         full_reason: str | None = None
 
         raw_cv = 0.0
@@ -781,7 +796,6 @@ class AdaptiveTensorParallelMuon(OrthogonalizedOptimizer):
                 raw_cv, _, _, z = self._snecv_update_and_score(p, grad, tp_group)
                 decision_threshold = tau_high
 
-                local_lr_scale = self._get_local_lr_scale(z, tau_high)
                 if z >= tau_high:
                     use_full = True
                     full_reason = "z"
@@ -801,7 +815,6 @@ class AdaptiveTensorParallelMuon(OrthogonalizedOptimizer):
             meta["snecv_pressure_threshold"] = float(self.snecv_pressure_threshold_h)
 
         meta["used_full_orth"] = bool(use_full)
-        meta["local_lr_scale"] = float(local_lr_scale)
         meta["snecv_raw_cv"] = float(raw_cv)
         meta["snecv_z"] = float(z)
         meta["snecv_full_reason"] = full_reason
@@ -820,7 +833,7 @@ class AdaptiveTensorParallelMuon(OrthogonalizedOptimizer):
             f"raw={raw_cv:.4f} z={z:.4f} "
             f"z_low={self.snecv_z_low:.4f} z_high={tau_high:.4f} "
             f"pressure={pressure:.4f} H={self.snecv_pressure_threshold_h:.4f} "
-            f"use_full={use_full} reason={full_reason} local_lr_scale={local_lr_scale:.4f}",
+            f"use_full={use_full} reason={full_reason}",
         )
 
         def run_one(mat: torch.Tensor) -> torch.Tensor:
@@ -859,6 +872,7 @@ class AdaptiveTensorParallelMuon(OrthogonalizedOptimizer):
             lr_base = group["lr"]
             lr_block = group.get("lr_block", lr_base)
             lr_full = group.get("lr_full", lr_base)
+            momentum = _get_momentum_value(group, self.defaults)
 
             for p in group["params"]:
                 if p.dim() == 1:
@@ -872,8 +886,7 @@ class AdaptiveTensorParallelMuon(OrthogonalizedOptimizer):
                 meta = self._get_meta(p)
 
                 used_full = bool(meta.get("used_full_orth", False))
-                local_lr_scale = float(meta.get("local_lr_scale", 1.0))
-                lr_eff = lr_full if used_full else (lr_block * local_lr_scale)
+                lr_eff = lr_full if used_full else lr_block
 
                 if "momentum_buffer" not in state:
                     state["momentum_buffer"] = torch.zeros_like(g)
@@ -887,10 +900,10 @@ class AdaptiveTensorParallelMuon(OrthogonalizedOptimizer):
                     group["weight_decay"],
                 )
 
-                exp_avg.lerp_(g, 1 - group["momentum_beta"])
+                exp_avg.lerp_(g, 1 - momentum)
 
-                if self.use_nesterov:
-                    upd = g.lerp(exp_avg, group["momentum_beta"])
+                if self.nesterov:
+                    upd = g.lerp(exp_avg, momentum)
                 else:
                     upd = exp_avg
 
@@ -1014,8 +1027,8 @@ def get_megatron_muon_optimizer(
 
     muon_kwargs = {
         "lr": config.lr,
-        "momentum_beta": config.muon_momentum,
-        "use_nesterov": config.muon_use_nesterov,
+        "momentum": config.muon_momentum,
+        "nesterov": getattr(config, "muon_nesterov", getattr(config, "muon_use_nesterov", False)),
         "weight_decay": config.weight_decay,
         "fp32_matmul_prec": config.muon_fp32_matmul_prec,
         "coefficient_type": getattr(config, "muon_coefficient_type", "simple"),
@@ -1041,8 +1054,6 @@ def get_megatron_muon_optimizer(
         "snecv_pressure_alpha": 1.0,
         "snecv_pressure_threshold_h": 4.0,
         "snecv_pressure_reset_factor": 0.0,
-        "snecv_local_lr_gamma": 0.5,
-        "snecv_use_smooth_local_lr_decay": True,
         "snecv_monitor_signal": "energy_cv",
         "snecv_monitor_sketch_q": 4,
         "snecv_monitor_power_iters": 2,
@@ -1077,7 +1088,6 @@ def get_megatron_muon_optimizer(
             "snecv_z_high": 9999.0,
             "snecv_pressure_gamma": 0.0,
             "snecv_pressure_threshold_h": 9999.0,
-            "snecv_local_lr_gamma": 0.0,        # 不衰减 blockwise LR
             "snecv_monitor_signal": "energy_cv", # 最轻量 monitor
             "snecv_monitor_sketch_q": 1,
             "snecv_monitor_power_iters": 0,
@@ -1102,7 +1112,6 @@ def get_megatron_muon_optimizer(
             "snecv_z_high": 9999.0,
             "snecv_pressure_gamma": 0.0,
             "snecv_pressure_threshold_h": 9999.0,
-            "snecv_local_lr_gamma": 0.0,
             "snecv_monitor_signal": "energy_cv",
             "snecv_monitor_sketch_q": 1,
             "snecv_monitor_power_iters": 0,
@@ -1117,9 +1126,11 @@ def get_megatron_muon_optimizer(
     #
     # 实现原理:
     #   warmup 结束后，每步计算 monitor signal → EWMA z-score →
-    #     z >= tau_high        → full orth (distributed NS + allgather)
-    #     z_low <= z < tau_high → 累积 leaky pressure；若 pressure >= H → full
-    #     z < z_low            → blockwise (local NS，零通信)
+    #     z >= tau_high -> full orth (distributed NS + allgather)
+    #     z < tau_high  -> blockwise (local NS，零通信)
+    #
+    # 这里不再暴露单独的 z_low 配置；preset 里直接令 z_low == z_high，
+    # 从而关闭 medium-band pressure 路径，并且不再改变 LR。
     #
     # 外部 config 可控的 sweep 维度:
     #   muon_snecv_monitor_signal   ∈ {energy_cv, stable_rank_cv, spectral_norm_cv,
@@ -1131,9 +1142,9 @@ def get_megatron_muon_optimizer(
         muon_kwargs.update({
             "lr_block": getattr(config, "muon_lr_block", config.lr),
             "lr_full": getattr(config, "muon_lr_full", config.lr),
-            "snecv_beta": getattr(config, "muon_snecv_beta", 0.98),
-            "snecv_z_low": getattr(config, "muon_snecv_z_low", 1.0),
+            "snecv_beta": getattr(config, "muon_snecv_beta", 0.999),
             "snecv_z_high": getattr(config, "muon_snecv_z_high", 3.0),
+            "snecv_z_low": getattr(config, "muon_snecv_z_high", 3.0),
             "snecv_warmup_steps": getattr(config, "muon_snecv_warmup_steps", 200),
             "snecv_pressure_gamma": getattr(config, "muon_snecv_pressure_gamma", 0.95),
             "snecv_pressure_alpha": getattr(config, "muon_snecv_pressure_alpha", 1.0),
@@ -1143,8 +1154,6 @@ def get_megatron_muon_optimizer(
             "snecv_pressure_reset_factor": getattr(
                 config, "muon_snecv_pressure_reset_factor", 0.0
             ),
-            "snecv_local_lr_gamma": getattr(config, "muon_snecv_local_lr_gamma", 0.5),
-            "snecv_use_smooth_local_lr_decay": True,
             "snecv_monitor_signal": getattr(
                 config, "muon_snecv_monitor_signal", "energy_cv"
             ),
@@ -1172,7 +1181,6 @@ def get_megatron_muon_optimizer(
             "snecv_z_high": 9999.0,
             "snecv_pressure_gamma": 0.0,
             "snecv_pressure_threshold_h": 9999.0,
-            "snecv_local_lr_gamma": 0.0,
             "snecv_monitor_signal": "energy_cv",
             "snecv_monitor_sketch_q": 1,
             "snecv_monitor_power_iters": 0,
