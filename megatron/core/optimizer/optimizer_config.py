@@ -349,6 +349,9 @@ class OptimizerConfig:
     muonbp_full_update_interval: int = 100
     """Full update interval for MuonBP config mode."""
 
+    muon_pressure_full_update_interval: int = 4
+    """Full update interval for pressure ablation Muon config mode."""
+
     #######################
     # Distributed optimizer
     #######################

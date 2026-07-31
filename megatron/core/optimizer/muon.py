@@ -294,6 +294,7 @@ class AdaptiveTensorParallelMuon(OrthogonalizedOptimizer):
         comm_budget_rho: float | None = None,
         snecv_stats_log_interval: int = 0,
         muonbp_full_update_interval: int | None = None,
+        pressure_full_update_interval: int | None = None,
         momentum_beta: float | None = None,
         use_nesterov: bool | None = None,
     ) -> None:
@@ -365,6 +366,11 @@ class AdaptiveTensorParallelMuon(OrthogonalizedOptimizer):
                 "muonbp_full_update_interval must be >= 1 when provided, "
                 f"got {muonbp_full_update_interval}"
             )
+        if pressure_full_update_interval is not None and pressure_full_update_interval < 1:
+            raise ValueError(
+                "pressure_full_update_interval must be >= 1 when provided, "
+                f"got {pressure_full_update_interval}"
+            )
 
         self.pg_collection = pg_collection
         self.mode = mode
@@ -393,6 +399,7 @@ class AdaptiveTensorParallelMuon(OrthogonalizedOptimizer):
         self.snecv_monitor_power_iters = snecv_monitor_power_iters
         self.snecv_stats_log_interval = snecv_stats_log_interval
         self.muonbp_full_update_interval = muonbp_full_update_interval
+        self.pressure_full_update_interval = pressure_full_update_interval
 
         # communication budget rho
         self.comm_budget_rho = comm_budget_rho
@@ -437,6 +444,7 @@ class AdaptiveTensorParallelMuon(OrthogonalizedOptimizer):
             "local_muon_ops": 0,
             "full_due_to_z": 0,
             "full_due_to_pressure": 0,
+            "full_comm_param_numel": 0,
             "z_above_high": 0,
             "z_between": 0,
             "z_below_low": 0,
@@ -454,6 +462,7 @@ class AdaptiveTensorParallelMuon(OrthogonalizedOptimizer):
         threshold: float,
         use_full: bool,
         full_reason: str | None = None,
+        full_comm_param_numel: int = 0,
     ) -> None:
         if z >= threshold:
             band_key = "z_above_high"
@@ -466,10 +475,24 @@ class AdaptiveTensorParallelMuon(OrthogonalizedOptimizer):
         for counters in (self._snecv_total_counts, self._snecv_step_counts):
             counters[band_key] += 1
             counters[op_key] += 1
+            if use_full:
+                counters["full_comm_param_numel"] += int(full_comm_param_numel)
             if use_full and full_reason == "z":
                 counters["full_due_to_z"] += 1
             elif use_full and full_reason == "pressure":
                 counters["full_due_to_pressure"] += 1
+
+    def _full_step_comm_param_numel(
+        self,
+        p: torch.Tensor,
+        tp_group: torch.distributed.ProcessGroup | None,
+        partition_dim: int | None,
+    ) -> int:
+        """Logical full-tensor numel that participates in a TP full-step communication."""
+        full_numel = int(p.numel())
+        if tp_group is not None and partition_dim is not None:
+            full_numel *= int(tp_group.size())
+        return full_numel
 
     def get_snecv_frequency_stats(self, reset_step: bool = False) -> Dict[str, Dict[str, int]]:
         stats = {
@@ -498,6 +521,7 @@ class AdaptiveTensorParallelMuon(OrthogonalizedOptimizer):
             f"step_local={step_stats['local_muon_ops']} "
             f"step_full_due_to_z={step_stats['full_due_to_z']} "
             f"step_full_due_to_pressure={step_stats['full_due_to_pressure']} "
+            f"step_full_comm_param_numel={step_stats['full_comm_param_numel']} "
             f"step_z_above_high={step_stats['z_above_high']} "
             f"step_z_between={step_stats['z_between']} "
             f"step_z_below_low={step_stats['z_below_low']} "
@@ -505,6 +529,7 @@ class AdaptiveTensorParallelMuon(OrthogonalizedOptimizer):
             f"total_local={total_stats['local_muon_ops']} "
             f"total_full_due_to_z={total_stats['full_due_to_z']} "
             f"total_full_due_to_pressure={total_stats['full_due_to_pressure']} "
+            f"total_full_comm_param_numel={total_stats['full_comm_param_numel']} "
             f"total_z_above_high={total_stats['z_above_high']} "
             f"total_z_between={total_stats['z_between']} "
             f"total_z_below_low={total_stats['z_below_low']}",
@@ -706,6 +731,12 @@ class AdaptiveTensorParallelMuon(OrthogonalizedOptimizer):
 
         return float(pressure), bool(in_medium_band)
 
+    def _update_pressure_counter(self, p: torch.Tensor) -> float:
+        """Per-parameter local-step counter used by the pressure ablation preset."""
+        meta = self._get_meta(p)
+        prev_pressure = float(meta.get("snecv_pressure", 0.0))
+        return float(prev_pressure + 1.0)
+
     def _update_budget_threshold(self, used_full: bool) -> None:
         """
         Online threshold adaptation to target the long-run full-step budget rho.
@@ -785,6 +816,7 @@ class AdaptiveTensorParallelMuon(OrthogonalizedOptimizer):
         raw_cv = 0.0
         z = 0.0
         pressure = float(meta.get("snecv_pressure", 0.0))
+        full_comm_param_numel = 0
         tau_high = self._current_full_threshold()
         decision_threshold = tau_high
 
@@ -792,6 +824,15 @@ class AdaptiveTensorParallelMuon(OrthogonalizedOptimizer):
             if self.muonbp_full_update_interval is not None:
                 use_full = step % self.muonbp_full_update_interval == 0
                 full_reason = "muonbp_interval" if use_full else None
+            elif (
+                self.pressure_full_update_interval is not None
+                and step >= self.snecv_warmup_steps
+            ):
+                pressure = self._update_pressure_counter(p)
+                if pressure >= float(self.pressure_full_update_interval):
+                    use_full = True
+                    full_reason = "pressure"
+                    pressure = self.snecv_pressure_reset_factor * pressure
             elif step >= self.snecv_warmup_steps:
                 raw_cv, _, _, z = self._snecv_update_and_score(p, grad, tp_group)
                 decision_threshold = tau_high
@@ -819,11 +860,16 @@ class AdaptiveTensorParallelMuon(OrthogonalizedOptimizer):
         meta["snecv_z"] = float(z)
         meta["snecv_full_reason"] = full_reason
         if can_switch:
+            if use_full:
+                full_comm_param_numel = self._full_step_comm_param_numel(
+                    p, tp_group, param_partition_dim
+                )
             self._record_snecv_decision(
                 z=z,
                 threshold=decision_threshold,
                 use_full=use_full,
                 full_reason=full_reason,
+                full_comm_param_numel=full_comm_param_numel,
             )
 
         log_single_rank(
@@ -1060,6 +1106,7 @@ def get_megatron_muon_optimizer(
         "snecv_stats_log_interval": getattr(config, "muon_snecv_stats_log_interval", 1),
         "comm_budget_rho": None,
         "muonbp_full_update_interval": None,
+        "pressure_full_update_interval": None,
     }
 
     # 把 muon_config_mode 仅当作 config 选择器，不传给构造函数
@@ -1166,7 +1213,42 @@ def get_megatron_muon_optimizer(
             "comm_budget_rho": getattr(config, "muon_comm_budget_rho", None),
         })
 
-    # Config 4: Original / Full Update Muon baseline
+    # Config 4: Pressure Ablation
+    # 目标: 每个 TP matrix 独立统计本地 local update 次数；累计到 interval 后做一次 full update。
+    #
+    # 实现原理:
+    #   不再依赖 monitor signal / z-score / medium band；
+    #   而是在每个参数自己的 meta["snecv_pressure"] 上按 local step 计数：
+    #     local step  -> pressure += 1
+    #     pressure >= interval -> full orth，并按 reset_factor 重置
+    #
+    # 因为计数是 per-parameter 的，所以它更接近“每个 matrix 每隔 K 个 local update 做一次 full”。
+    elif muon_config_mode == "pressure":
+        muon_kwargs.update({
+            "lr_block": getattr(config, "muon_lr_block", config.lr),
+            "lr_full": getattr(config, "muon_lr_full", config.lr),
+            "snecv_warmup_steps": getattr(config, "muon_snecv_warmup_steps", 0),
+            "snecv_z_low": 0.0,
+            "snecv_z_high": 9999.0,
+            "snecv_pressure_gamma": 1.0,
+            "snecv_pressure_alpha": 0.0,
+            "snecv_pressure_threshold_h": getattr(
+                config, "muon_pressure_full_update_interval", 4
+            ),
+            "snecv_pressure_reset_factor": getattr(
+                config, "muon_snecv_pressure_reset_factor", 0.0
+            ),
+            "snecv_monitor_signal": "energy_cv",
+            "snecv_monitor_sketch_q": 1,
+            "snecv_monitor_power_iters": 0,
+            "comm_budget_rho": None,
+            "muonbp_full_update_interval": None,
+            "pressure_full_update_interval": getattr(
+                config, "muon_pressure_full_update_interval", 4
+            ),
+        })
+
+    # Config 5: Original / Full Update Muon baseline
     # 目标: 每步都做 full distributed Newton-Schulz iteration + 全通信。
     #
     # 实现原理:
@@ -1189,7 +1271,7 @@ def get_megatron_muon_optimizer(
         })
     else:
         raise ValueError(
-            "muon_config_mode must be one of {'blockwise', 'muonbp', 'snecv', 'muon'}, "
+            "muon_config_mode must be one of {'blockwise', 'muonbp', 'snecv', 'pressure', 'muon'}, "
             f"got {muon_config_mode!r}"
         )
 
